@@ -1,0 +1,654 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Created on 27/01/15
+
+@author: Matthias Blum
+"""
+
+import argparse
+import ConfigParser
+import libngsqc
+import gviewer as gv
+import ngsqcdb
+import os
+import reporting
+import shutil
+import subprocess
+import sys
+import libtargets
+import tempfile
+import time
+import zipfile
+
+from datetime import datetime
+
+
+VERSION = '1.7.1'
+LAST_UPDATE = '150302'
+
+errors = {
+    1: 'Error while converting BAM file to BED file',
+    2: 'Error while decompressing BED file',
+    3: 'Error in NGSQC_bed_utils (integrity)',
+    4: 'Ill-formated BED file',
+    5: 'Error in NGSQC_bed_utils (issorted)',
+    6: 'Error while sorting BED file',
+    7: 'Error in NGSQC_bed_utils (unique)',
+    8: 'Error in NGSQC_bed_utils (unique write)',
+    9: 'Error in get_genome_info function',
+    10: 'Error while computing indicators',
+    11: 'Error while generating report',
+    12: 'Error while computing global background (value of lambda might be too high)'
+}
+
+config = ConfigParser.ConfigParser()
+config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
+
+
+def get_indicators(bed_file, output_dir, genome_file, bg_thres, rep=1, gnuplot=None):
+    """
+
+    :param bed_file:
+    :param output_dir:
+    :param genome:
+    :param bg_thres:
+    :param rep:
+    :return:
+    """
+    bin_path = os.path.join(os.path.dirname(__file__), 'utils', 'NGSQC_bed_utils')
+
+    sam_table = os.path.join(output_dir, 'sam_10pc_all_replicate_{0}.txt'.format(rep))
+    track_table = os.path.join(output_dir, 'local_QC-scores_replicate_{0}.s50_10pc.bed'.format(rep))
+    bins_table = os.path.join(output_dir, 'table_samples_replicate_{0}.txt'.format(rep))
+
+    cl1 = [bin_path, 'bin_table', bed_file, genome_file, 500, bg_thres, output_dir, '--plot']
+
+    if gnuplot is not None:
+        cl1 += ['--gnuplot-path', gnuplot]
+
+    cl2 = [bin_path, 'globalQC', 'stdin', bg_thres, '--sam-table', sam_table, '--bed-track', track_table, '--wigs', output_dir]
+
+    cl1 = [str(i) for i in cl1]
+    cl2 = [str(i) for i in cl2]
+
+    with open(os.devnull, 'w') as devnull:
+        pop1 = subprocess.Popen(cl1, stdout=subprocess.PIPE)
+        pop2 = subprocess.Popen(['tee', bins_table], stdin=pop1.stdout, stdout=subprocess.PIPE)
+        pop3 = subprocess.Popen(cl2, stdin=pop2.stdout, stdout=subprocess.PIPE, stderr=devnull)
+        out, err = pop3.communicate()
+        pop1.communicate()
+        pop2.communicate()
+
+    if pop1.returncode != 0 or pop2.returncode != 0 or pop3.returncode != 0:
+        try:
+            os.unlink(sam_table)
+        except:
+            pass
+        try:
+            os.unlink(track_table)
+        except:
+            pass
+        try:
+            os.unlink(bins_table)
+        except:
+            pass
+        return None
+
+    bins_table_gz = libngsqc.gzip(bins_table, output_dir)
+
+    if bins_table_gz is None:
+        for f in os.listdir(output_dir):
+            if f.endswith(('sam_10pc_all', 'local_QC-scores')) or f[-4:] == '.wig':
+                os.unlink(os.path.join(output_dir, f))
+        return None
+
+    os.unlink(bins_table)
+
+    indicators = {}
+
+    for line in out.rstrip().split('\n'):
+        k, v = line.split('\t', 1)
+
+        if k == 'Bins':
+            indicators['bins'] = int(v)
+        elif k == 'Bins w/o background':
+            indicators['bins2'] = int(v)
+        elif k == 'DenQC_s90_2.5pc':
+            indicators['denqc_90_2.5'] = float(v)
+        elif k == 'DenQC_s90_5pc':
+            indicators['denqc_90_5'] = float(v)
+        elif k == 'DenQC_s90_10pc':
+            indicators['denqc_90_10'] = float(v)
+        elif k == 'DenQC_s50_2.5pc':
+            indicators['denqc_50_2.5'] = float(v)
+        elif k == 'DenQC_s50_5pc':
+            indicators['denqc_50_5'] = float(v)
+        elif k == 'DenQC_s50_10pc':
+            indicators['denqc_50_10'] = float(v)
+        elif k == 'SimQC_2.5pc':
+            indicators['simqc_2.5'] = float(v)
+        elif k == 'SimQC_5pc':
+            indicators['simqc_5'] = float(v)
+        elif k == 'SimQC_10pc':
+            indicators['simqc_10'] = float(v)
+
+    # Renaming files
+    for f in os.listdir(output_dir):
+        if f[-4:] == '.wig':
+            chrm, string = f.split('_', 1)
+            dest = '{0}_replicate_{1}.{2}'.format(chrm, rep, string)
+        elif f.startswith('dispersion_s50_s70_s90'):
+            dest = 'dispersion_s50_s70_s90_replicate_{0}.png'.format(rep)
+        elif f.startswith('pc_s50_s70_s90_'):
+            dest = 'pc_s50_s70_s90_replicate_{0}.png'.format(rep)
+        else:
+            continue
+
+        os.rename(os.path.join(output_dir, f), os.path.join(output_dir, dest))
+
+    return indicators
+
+
+def shrink_region(region, new_res):
+    """
+    Reduce a region's size and get rid of the dispersions/wigs/genes outside this new region
+    :param region:              The region to shrink
+    :param new_res:      Size in bp of the new region
+    :return:
+    """
+    new_start = region['start'] + (region['end'] - region['start']) / 2 - new_res / 2
+    new_end = new_start + new_res
+
+    new_disps = [disp for disp in region['disps'] if new_start <= disp[0] < new_end]
+    new_wigs = [wig for wig in region['wigs'] if new_start <= wig[0] < new_end]
+    new_genes = []
+
+    for gene in region['genes']:
+        if new_start <= gene[0] < new_end or new_start < gene[1] <= new_end or gene[0] <= new_start < new_end <= gene[1]:
+            if gene[0] < new_start:
+                gene[0] = new_start
+            if gene[1] > new_end:
+                gene[1] = new_end
+            new_genes.append(gene)
+
+    return {
+        'chrm': region['chrm'],
+        'start': new_start,
+        'end': new_end,
+        'disps': new_disps,
+        'genes': new_genes,
+        'wigs': new_wigs,
+        'binstart': region.get('binstart')
+    }
+
+
+def ngsqc(input_file, output_dir, genome, **kwargs):
+    background = kwargs.get('background', 'both')  # both / pdisp / none
+    num_regions = kwargs.get('regions', 4)
+    low_res = kwargs.get('low_res', 500000)
+    high_res = kwargs.get('high_res', 50000)
+    num_replicates = kwargs.get('rep', 1)
+    nodup = kwargs.get('nodup', False)
+    is_clean = kwargs.get('isclean', False)
+    target = kwargs.get('target')
+    quiet = kwargs.get('quiet', False)
+    tmp_dir = kwargs.get('tmpdir')
+
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp()
+        rm_tmp = True
+    else:
+        rm_tmp = False
+
+    # Galaxy options
+    galaxy = kwargs.get('galaxy')
+    sam_dest = kwargs.get('sam')
+    html_dest = kwargs.get('html')
+
+    files = [input_file]
+    output_files = []
+
+    run_time = time.time()
+    if not quiet:
+        print 'Input file: {}'.format(os.path.basename(input_file))
+
+    # Define the input file's format
+    if galaxy:
+        # Either BAM or BED. Gzip files are decompressed by Galaxy.
+        if libngsqc.is_binary(input_file):
+            file_format = 'bam'
+        else:
+            file_format = 'bed'
+    elif input_file[-3:].lower() == '.gz':
+        file_format = 'gz'
+    elif input_file[-4:].lower() == '.bam':
+        file_format = 'bam'
+    else:
+        file_format = 'bed'
+
+    if file_format == 'bam':
+        # Bam -> Bed
+        if not quiet:
+            print '\tBAM to BED conversion'
+        bed_file = libngsqc.bamtobed(input_file, tmp_dir, bedtools=config.get('softwares', 'bedtools'))
+
+        if bed_file is None:
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 1
+    elif file_format == 'gz':
+        # Extract compressed file
+        if not quiet:
+            print '\tExtracting BED file'
+        bed_file = libngsqc.gzip(input_file, tmp_dir, decompress=True)
+
+        if bed_file is None:
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 2
+    else:
+        bed_file = input_file
+
+    files.append(bed_file)
+
+    # At this point, we have a bed file
+    if not quiet:
+        print '\tVerifying BED file integrity'
+    code, reads, no_header, chrms_lst, last_line = libngsqc.bed_integrity(bed_file)
+
+    if code is None:
+        libngsqc.clean(files)
+        if rm_tmp:
+            shutil.rmtree(tmp_dir)
+        return 3
+    elif code != 0:
+        # bed file is not well formated
+        libngsqc.clean(files)
+        if rm_tmp:
+            shutil.rmtree(tmp_dir)
+        return 4
+
+    if not is_clean:
+        # Verify if the bed file is sorted. If it is not, we sort it.
+        if not quiet:
+            print '\tVerifying if file is sorted'
+        code = libngsqc.bed_issorted(bed_file, noheader=no_header)
+
+        if code is None:
+            libngsqc.clean(files)
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 5
+        elif code is False:
+            if not quiet:
+                print '\tSorting file'
+            bed_file = libngsqc.bed_sort(bed_file, tmp_dir,
+                                         cores=config.getint('performance', 'cores'),
+                                         memory=config.getint('performance', 'memory'),
+                                         sort=config.get('softwares', 'sort'))
+
+            if bed_file is None:
+                libngsqc.clean(files)
+                if rm_tmp:
+                    shutil.rmtree(tmp_dir)
+                return 6
+
+            files.append(bed_file)
+
+    # Count the number of unique reads
+    if not quiet:
+        print '\tCounting unique reads'
+    unique_reads = libngsqc.unique_count(bed_file, noheader=no_header)
+
+    if unique_reads is None:
+        libngsqc.clean(files)
+        if rm_tmp:
+            shutil.rmtree(tmp_dir)
+        return 7
+
+    if nodup:
+        # Delete the PCR duplicate reads
+        if not quiet:
+            print '\tRemoving PCR duplicate reads'
+        bed_file = libngsqc.unique_filter(bed_file, tmp_dir, noheader=no_header)
+
+        if bed_file is None:
+            libngsqc.clean(files)
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 8
+        files.append(bed_file)
+
+    # Dictionary of chromosomes and their size
+    genome_info = libngsqc.get_genome_info(genome)
+
+    if genome_info is None:
+        libngsqc.clean(files)
+        if rm_tmp:
+            shutil.rmtree(tmp_dir)
+        return 9
+
+    # Poisson distribution background
+    bg_thres = libngsqc.get_bg(reads, sum(genome_info.values()),
+                               confint=0.9999, sampling=(0.9, 0.7, 0.5))
+
+    if bg_thres is None:
+        if rm_tmp:
+            shutil.rmtree(tmp_dir)
+        libngsqc.clean(files)
+        return 12
+
+    gfile, del_gfile = libngsqc.rewrite_genome_file(chrms_lst, genome)
+
+    for rep in range(num_replicates):
+        rep += 1
+        # Write the bins table and compute the NGS-QC indicators
+        if not quiet:
+            print '\tReplicate #{0}: computing indicators'.format(rep)
+        indicators = get_indicators(bed_file, tmp_dir, gfile, bg_thres[1], rep=rep, gnuplot=config.get('softwares', 'gnuplot'))
+
+        if indicators is None:
+            libngsqc.clean(files)
+            if del_gfile:
+                os.unlink(gfile)
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 10
+
+        sam_table = os.path.join(tmp_dir, 'sam_10pc_all_replicate_{0}.txt'.format(rep))
+
+        if num_regions > 0:
+            if not quiet:
+                print '\tReplicate #{0}: printing genomic regions'.format(rep)
+            # Select the "best" regions according to their dispersion
+            regions, total_reads = gv.select_regions(sam_table, genome, low_res, gfile=gfile)
+
+            if regions:
+                # Filter by reads (standard deviation)
+                regions = gv.selectbyintensity(regions, total_reads)
+
+                for chrm, reg_lst in regions.items():
+                    regions[chrm] = reg_lst[:num_regions*5]
+
+                # Remove overlapping regions (more than 25%)
+                regions = gv.rm_overlap(regions, low_res)
+
+                # For not slowing down SQlite too much :-/
+                # Each chromosome has as much regions that we want, which should be enough
+                for chrm, reg_lst in regions.items():
+                    regions[chrm] = reg_lst[:num_regions]
+
+                # Keep regions with at least one gene
+                regions = gv.find_genes(regions, genome, resolution=high_res, minsize=100, mingenes=1)
+
+                # Keep only the best regions for each chromosome
+                regions = gv.enqueue_regions(regions, num_regions)
+
+                regions = regions[:num_regions]
+
+                # Get the dispersion of each local QC bin in each region
+                regions = gv.get_disp(sam_table, regions, bg_threshold=bg_thres[1])
+
+                # Get the wiggles for each region
+                regions = gv.get_wigs(regions, bed_file)
+
+                # Color bar (for report)
+                gv.colorbar(os.path.join(tmp_dir, 'colorbar.png'), gnuplot=config.get('softwares', 'gnuplot'))
+
+                for i, r in enumerate(regions):
+                    png = os.path.join(tmp_dir, 'localqc.rep{0}.region{1}.png'.format(rep, i*2+1))
+                    gv.plot(r, png, genedetails=False, gnuplot=config.get('softwares', 'gnuplot'))
+
+                    r = shrink_region(r, new_res=high_res)
+
+                    png = os.path.join(tmp_dir, 'localqc.rep{0}.region{1}.png'.format(rep, i*2+2))
+                    gv.plot(r, png, gnuplot=config.get('softwares', 'gnuplot'))
+
+        summary = os.path.join(tmp_dir, 'summary_replicate_{0}.txt'.format(rep))
+        with open(summary, 'w') as fo:
+            fo.write('Generated by NGS-QC Generator {0} on {1}\n'.format(VERSION,
+                                                                         datetime.now().strftime('%Y-%m-%d %H:%M')))
+            fo.write('Clonal reads removed\t{0}\n'.format(nodup))
+            fo.write('Background subtracted\t{0}\n'.format(True))
+            fo.write('Input file\t{0}\n'.format(galaxy if galaxy else os.path.basename(bed_file)))
+            fo.write('Genome assembly\t{0}\n'.format(genome))
+            fo.write('Replicate\t{0}/{1}\n'.format(rep, num_replicates))
+            fo.write('Strand mode\tboth\n')
+            fo.write('Windows size\t500\n')
+            fo.write('Sampling\t{0}\n'.format(','.join(str(i) for i in (0.5, 0.7, 0.9))))
+            fo.write('Reads\t{0}\n'.format(reads))
+            fo.write('Unique reads\t{0}\n'.format(unique_reads))
+            fo.write('Bins\t{0}\n'.format(indicators['bins']))
+            fo.write('DenQC_s90_2.5pc(%)\t{0}\n'.format(indicators['denqc_90_2.5']))
+            fo.write('DenQC_s50_2.5pc(%)\t{0}\n'.format(indicators['denqc_50_2.5']))
+            fo.write('SimQC_2.5pc (DenQC_s90/s50)\t{0}\n'.format(indicators['simqc_2.5']))
+            fo.write('DenQC_s90_5pc(%)\t{0}\n'.format(indicators['denqc_90_5']))
+            fo.write('DenQC_s50_5pc(%)\t{0}\n'.format(indicators['denqc_50_5']))
+            fo.write('SimQC_5pc (DenQC_s90/s50)\t{0}\n'.format(indicators['simqc_5']))
+            fo.write('DenQC_s90_10pc(%)\t{0}\n'.format(indicators['denqc_90_10']))
+            fo.write('DenQC_s50_10pc(%)\t{0}\n'.format(indicators['denqc_50_10']))
+            fo.write('SimQC_10pc (DenQC_s90/s50)\t{0}\n'.format(indicators['simqc_10']))
+            fo.write('Chromosomes\t{0}\n'.format(','.join(chrms_lst)))
+            fo.write('Threshold (100%)\t{0}\n'.format(bg_thres[1]))
+            fo.write('Threshold (90%)\t{0}\n'.format(bg_thres[0.9]))
+            fo.write('Threshold (50%)\t{0}\n'.format(bg_thres[0.5]))
+            fo.write('Bins w/o background\t{0}\n'.format(indicators['bins2']))
+            fo.write('Conf. interval\t{0}\n'.format(0.995))
+
+        if target:
+            qc_val_10 = libngsqc.get_qcvalue(indicators['denqc_50_10'], indicators['simqc_10'])
+            public_data = libtargets.find_target(target, genome)
+            dest = os.path.join(tmp_dir, 'public.png')
+            libtargets.plot(public_data, reads, qc_val_10, dest, ngsqcdb.quartiles_dict['bgs'][10])
+
+        pdf_report = reporting.init(summary, os.path.join(tmp_dir, 'NGS-QC_report_replicate_{0}.pdf'.format(rep)),
+                                    tmp_dir,
+                                    target=target,
+                                    quartiles=ngsqcdb.quartiles_dict,
+                                    dbversion=ngsqcdb.db_version)
+
+        if pdf_report is None:
+            libngsqc.clean(files)
+            if del_gfile:
+                os.unlink(gfile)
+            if rm_tmp:
+                shutil.rmtree(tmp_dir)
+            return 11
+
+        # Move PDF report
+        report_dest = os.path.join(output_dir, os.path.basename(pdf_report))
+        try:
+            os.unlink(report_dest)
+        except:
+            pass
+        finally:
+            shutil.move(pdf_report, report_dest)
+
+        # Copy replicate's sam table (to be displayed in the Galaxy user's history)
+        if sam_dest:
+            try:
+                shutil.copy(os.path.join(tmp_dir, 'sam_10pc_all_replicate_{0}.txt'.format(rep)), sam_dest[rep-1])
+            except:
+                pass
+
+        # Compress supplementary files
+        zip_name = 'local_QC_indicators_replicate_{0}.zip'.format(rep)
+        zip_path = os.path.join(output_dir, zip_name)
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+            for f in os.listdir(tmp_dir):
+                f_path = os.path.join(tmp_dir, f)
+                if f.startswith(('local_QC-scores', 'sam_10pc_all', 'dispersion_s50_s70_s90', 'pc_s50_s70_s90', 'summary', 'public')):
+                    z.write(f_path, f)
+                    os.unlink(f_path)
+                elif f.endswith('.wig'):
+                    z.write(f_path, os.path.join('wigs', f))
+                    os.unlink(f_path)
+                elif f.startswith(('colorbar', 'localqc')) and f.endswith('.png'):
+                    z.write(f_path, os.path.join('localqc', f))
+                    os.unlink(f_path)
+
+        output_files.append([report_dest, zip_path])
+
+        bin_table_gz = os.path.join(tmp_dir, 'table_samples_replicate_{0}.txt.gz'.format(rep))
+        if galaxy:
+            # We don't provide the bin table to Galaxy users
+            os.unlink(bin_table_gz)
+        else:
+            # Move the bin table
+            dest = os.path.join(output_dir, os.path.basename(bin_table_gz))
+            try:
+                os.unlink(dest)
+            except:
+                pass
+            finally:
+                shutil.move(bin_table_gz, dest)
+
+    if html_dest:
+        reporting.write_html(html_dest, galaxy, genome, output_files, run_time=time.time()-run_time)
+
+    libngsqc.clean(files)
+    if rm_tmp:
+        shutil.rmtree(tmp_dir)
+    if del_gfile:
+        os.unlink(gfile)
+
+    if not quiet:
+        print '\tExecution time: {0} seconds'.format(int(time.time() - run_time))
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description='NGS-QC Generator: Control the quality of profiles'
+                                                 'obtained by ChIP-sequencing')
+
+    parser.add_argument('input',
+                        metavar='<input>',
+                        help='BED/BAM file')
+
+    parser.add_argument('-o',
+                        dest='output_dir',
+                        help='Output directory (default: working directory)')
+
+    parser.add_argument('-g', '--genome',
+                        required=True,
+                        help='Genome assembly')
+
+    parser.add_argument('-b', '--background',
+                        dest='background',
+                        default='pdisp',
+                        choices=['pdisp', 'none', 'both'],
+                        help='Background subtraction.\n\tpdisp:\tPoisson distribution\n\tnone:\tbackground is kept\n')
+
+    parser.add_argument('-l', '--localqc',
+                        dest='num_regions',
+                        type=int,
+                        default=4,
+                        help='Number of local QC regions (default: 4)')
+
+    parser.add_argument('--lowres',
+                        dest='low_res',
+                        type=int,
+                        default=500000,
+                        help='LocalQC: low resolution (default: 500,000 bp)')
+
+    parser.add_argument('-r',
+                        dest='num_rep',
+                        type=int,
+                        default=1,
+                        help='Number of virtual replicates (default: 1)')
+
+    parser.add_argument('--tmp',
+                        dest='tmp_dir',
+                        help='Temporary directory (default: /tmp/)')
+
+    parser.add_argument('--nodup',
+                        dest='nodup',
+                        action='store_true',
+                        default=False,
+                        help='Remove PCR duplicate reads')
+
+    parser.add_argument('--isclean',
+                        dest='isclean',
+                        action='store_true',
+                        default=False,
+                        help='Consider the input file as sorted')
+
+    parser.add_argument('--quiet', action='store_true', help='Quiet mode')
+
+    parser.add_argument('--target',
+                        help="If provided, plot the input dataset's results "
+                             "against the public data for the given target")
+
+    parser.add_argument('--galaxy',
+                        help='File name for Galaxy dataset')
+
+    parser.add_argument('--sam',
+                        nargs='+',
+                        help='Paths to sam (10%%) tables (galaxy)')
+
+    parser.add_argument('--html', help='Path to HTML file (galaxy)')
+
+    args = parser.parse_args()
+
+    if not args.galaxy and not args.input.lower().endswith(('.bed.gz', '.bed', '.bam')):
+        sys.stderr.write('Input file format not supported (only bed, bed.gz, and bam files)\n')
+        exit(-1)
+
+    if args.output_dir is None:
+        args.output_dir = os.getcwd()
+    elif not os.path.isdir(args.output_dir):
+        try:
+            os.mkdir(args.output_dir)
+        except Exception as e:
+            sys.stderr.write('{0}: {1}\n'.format(type(e), e))
+            exit(-1)
+
+    genome_file = os.path.join(os.path.dirname(__file__), 'genomes', args.genome)
+    if not os.path.isfile(genome_file):
+        sys.stderr.write('Invalid genome assembly ({0})\n'.format(args.genome))
+        sys.stderr.write('Supported genome assemblies:\n')
+
+        for f in sorted(os.listdir(os.path.join(os.path.dirname(__file__), 'genomes'))):
+            sys.stderr.write('\t{0}\n'.format(f))
+        exit(-1)
+
+    if args.num_regions < 0:
+        sys.stderr.write('Invalid number of regions ({0})\n'.format(args.num_regions))
+        exit(-1)
+
+    if args.low_res < 0:
+        sys.stderr.write('Invalid resolution ({0})\n'.format(args.low_res))
+        exit(-1)
+
+    if args.num_rep < 0:
+        sys.stderr.write('Invalid number of replicates ({0})\n'.format(args.num_rep))
+        exit(-1)
+
+    if args.tmp_dir is not None and not os.path.isdir(args.tmp_dir):
+        sys.stderr.write('Temporary directory does not exist ({0})\n'.format(args.tmp_dir))
+        exit(-1)
+
+    code = ngsqc(args.input, args.output_dir, args.genome,
+                 background=args.background,
+                 isclean=args.isclean,
+                 nodup=args.nodup,
+                 regions=args.num_regions,
+                 low_res=args.low_res,
+                 rep=args.num_rep,
+                 tmpdir=args.tmp_dir,
+                 target=args.target,
+                 galaxy=args.galaxy,
+                 sam=args.sam,
+                 html=args.html,
+                 quiet=args.quiet)
+
+    if code:
+        sys.stderr.write(errors.get(code, '') + '\n')
+
+
+
+if __name__ == '__main__':
+    main()
