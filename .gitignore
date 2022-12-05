@@ -1,0 +1,5 @@
+*.pyc
+dist/*
+utils/NGSQC_bed_utils
+utils/wigit/wigit
+*~
