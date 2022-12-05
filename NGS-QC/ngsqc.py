@@ -23,7 +23,7 @@ import zipfile
 from datetime import datetime
 from subprocess import Popen, PIPE
 
-VERSION = '1.7.4'
+VERSION = '1.7.6'
 
 config = ConfigParser.ConfigParser()
 config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
@@ -62,6 +62,7 @@ def compute_indicators(bedutils, bed, outdir, genomefile, bg=1, rep=1, gnuplot='
         pop1 = Popen(cmd, stdout=PIPE, stderr=dn)
         pop2 = Popen(['gzip', '-c'], stdin=pop1.stdout, stdout=fh, stderr=dn)
         pop2.wait()
+        pop1.wait()
 
     files = [localqc_table, bed_track, bins_table, indicators_file]
     efiles = [f for f in files if os.path.isfile(f)]
@@ -69,7 +70,7 @@ def compute_indicators(bedutils, bed, outdir, genomefile, bg=1, rep=1, gnuplot='
     if len(files) != len(efiles) or pop2.returncode != 0:
         for f in efiles:
             os.unlink(f)
-        return None, None, None
+        return None, None
 
     indicators = {}
     with open(indicators_file) as f:
@@ -97,6 +98,7 @@ def compute_indicators(bedutils, bed, outdir, genomefile, bg=1, rep=1, gnuplot='
                 indicators['simqc_5'] = float(v)
             elif k == 'SimQC_10pc':
                 indicators['simqc_10'] = float(v)
+
     # We don't need this file any more
     os.unlink(indicators_file)
 
@@ -342,7 +344,7 @@ def ngsqc(infile, outdir, genome, **kwargs):
                                       chrms, genome, target=target, nodup=nodup,
                                       nobgs=nobgs, binsize=500, bg=bg, ci=0.995)
 
-                        dbquartiles, dbversion = libquartiles.get(bg='global')
+                        dbquartiles, dbversion = libquartiles.get()
                         if target:
                             organism = libngs.getorganism(genome)
                             public_data, target = libtargets.get_data(target, organism)

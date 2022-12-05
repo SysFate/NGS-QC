@@ -149,8 +149,6 @@ def bedintegrity(bedutils, bed):
                 min_read_size, max_read_size, noheader, chrms, last_line)
 
 
-
-
 def isbedsorted(bedutils, bed, noheader=False):
     """
     Verify if a BED file is sorted

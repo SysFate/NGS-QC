@@ -215,5 +215,5 @@ def list_targets():
 
 
 if __name__ == '__main__':
-    #init_db(sys.argv[1])
+    init_db(sys.argv[1])
     list_targets()

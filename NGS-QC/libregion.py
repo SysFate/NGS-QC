@@ -399,27 +399,25 @@ def get_wigs(wigit, regions, bed):
     pop = Popen(cmd, stdout=PIPE)
     parse= False
     for i, line in enumerate(pop.stdout):
-        if i > 0:
-            # First like starts with "track" and does not interest us
-            if line.startswith('variableStep'):
-                # Line like: variableStep chrom=chr21 span=20
-                chrm = line.split()[1][6:]
+        if line.startswith('variableStep'):
+            # Line like: variableStep chrom=chr21 span=20
+            chrm = line.split()[1][6:]
 
-                if chrm in regions_chrm:
-                    parse = True
-                else:
-                    parse = False
-            elif parse:
-                try:
-                    wig, reads = line.rstrip().split('\t')
-                    wig = int(wig)
-                    reads = int(reads)
-                except:
-                    continue
-                else:
-                    for r in regions_chrm[chrm]:
-                        if r['start'] <= wig <= r['end']:
-                            r['wigs'].append([wig, reads])
+            if chrm in regions_chrm:
+                parse = True
+            else:
+                parse = False
+        elif parse:
+            try:
+                wig, reads = line.rstrip().split('\t')
+                wig = int(wig)
+                reads = int(reads)
+            except:
+                continue
+            else:
+                for r in regions_chrm[chrm]:
+                    if r['start'] <= wig <= r['end']:
+                        r['wigs'].append([wig, reads])
     pop.wait()
 
     regions = [None] * len(regions)
